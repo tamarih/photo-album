@@ -2,6 +2,17 @@ import { ChangeEvent, CSSProperties, useEffect, useMemo, useRef, useState } from
 import { BlobReader, BlobWriter, ZipReader } from "@zip.js/zip.js";
 
 import { flushSync } from "react-dom";
+import {
+  MAX_ZOOM,
+  MIN_ZOOM,
+  PhotoAdjustDialog,
+  PhotoCrop,
+  clampNumber,
+  cleanCrop,
+  cleanZoom,
+  croppedRatio,
+  photoAdjustStyle,
+} from "./PhotoAdjust";
 
 function CoverText({ label, text, onEdit }: {
   label: string;
@@ -32,6 +43,9 @@ type Photo = {
   hash?: string;
   sharpness?: number;
   exposure?: number;
+  // Size inside its cell: below 1 the photo shrinks, above 1 it zooms in (edges are cut). Proportions never change.
+  zoom?: number;
+  crop?: PhotoCrop;
 };
 
 type CoverImage = Pick<Photo, "id" | "name" | "url">;
@@ -303,7 +317,7 @@ function getPageOrientationClass(pagePhotos: Photo[]) {
 }
 
 function photoRatio(photo: Photo) {
-  const ratio = photo.width && photo.height ? photo.width / photo.height : 1;
+  const ratio = croppedRatio(photo);
   return Math.min(3.5, Math.max(0.3, ratio));
 }
 
@@ -937,6 +951,75 @@ export default function Home() {
   const [draggedPhotoId, setDraggedPhotoId] = useState("");
   const [dropTarget, setDropTarget] = useState<DropTarget>(null);
   const [showDuplicates, setShowDuplicates] = useState(false);
+  const [adjustingPhotoId, setAdjustingPhotoId] = useState("");
+  const adjustingPhoto = photos.find((photo) => photo.id === adjustingPhotoId);
+
+  function savePhotoAdjust(photoId: string, zoom: number, crop: PhotoCrop | undefined) {
+    rememberUndo("שינוי גודל וחיתוך");
+    setPhotos((current) => current.map((photo) => (
+      photo.id === photoId ? { ...photo, zoom: cleanZoom(zoom), crop } : photo
+    )));
+  }
+  const savePhotoAdjustRef = useRef(savePhotoAdjust);
+  savePhotoAdjustRef.current = savePhotoAdjust;
+  const photosRef = useRef(photos);
+  photosRef.current = photos;
+
+  // Two-finger pinch on a photo in the album: spread to enlarge, pinch to shrink. Proportions are kept.
+  useEffect(() => {
+    let pinch: { frame: HTMLElement; photoId: string; startDistance: number; startZoom: number; zoom: number } | null = null;
+    const distance = (touches: TouchList) => Math.hypot(
+      touches[0].clientX - touches[1].clientX,
+      touches[0].clientY - touches[1].clientY,
+    );
+    function onStart(event: TouchEvent) {
+      if (event.touches.length !== 2) return;
+      const target = event.target as Element | null;
+      const frame = target?.closest?.(".photo-grid .photo-frame[data-photo-id]") as HTMLElement | null;
+      if (!frame) return;
+      const photoId = frame.dataset.photoId || "";
+      const photo = photosRef.current.find((item) => item.id === photoId);
+      if (!photo) return;
+      const startZoom = photo.zoom ?? 1;
+      pinch = { frame, photoId, startDistance: Math.max(distance(event.touches), 1), startZoom, zoom: startZoom };
+      frame.classList.add("is-pinching");
+    }
+    function onMove(event: TouchEvent) {
+      if (!pinch || event.touches.length !== 2) return;
+      event.preventDefault();
+      const zoom = clampNumber(pinch.startZoom * (distance(event.touches) / pinch.startDistance), MIN_ZOOM, MAX_ZOOM);
+      pinch.zoom = zoom;
+      pinch.frame.style.setProperty("--size", String(Math.min(zoom, 1)));
+      pinch.frame.style.setProperty("--zoom", String(Math.max(zoom, 1)));
+    }
+    function onEnd() {
+      if (!pinch) return;
+      const { frame, photoId, startZoom, zoom } = pinch;
+      pinch = null;
+      frame.classList.remove("is-pinching");
+      if (Math.abs(zoom - startZoom) < 0.02) return;
+      const photo = photosRef.current.find((item) => item.id === photoId);
+      savePhotoAdjustRef.current(photoId, zoom, photo?.crop);
+    }
+    // Stops Safari from zooming the whole page while a photo is being pinched.
+    function onGesture(event: Event) {
+      if (pinch) event.preventDefault();
+    }
+    document.addEventListener("touchstart", onStart, { passive: true });
+    document.addEventListener("touchmove", onMove, { passive: false });
+    document.addEventListener("touchend", onEnd);
+    document.addEventListener("touchcancel", onEnd);
+    document.addEventListener("gesturestart", onGesture);
+    document.addEventListener("gesturechange", onGesture);
+    return () => {
+      document.removeEventListener("touchstart", onStart);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onEnd);
+      document.removeEventListener("touchcancel", onEnd);
+      document.removeEventListener("gesturestart", onGesture);
+      document.removeEventListener("gesturechange", onGesture);
+    };
+  }, []);
   const [duplicateRemovals, setDuplicateRemovals] = useState<Set<string>>(new Set());
   const [keptDuplicateGroups, setKeptDuplicateGroups] = useState<Set<string>>(new Set());
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1292,6 +1375,8 @@ export default function Home() {
               signature: fileSignature(file),
               date: photoDateFrom(file, metadata),
               detectedPlace: undefined,
+              crop: undefined,
+              zoom: undefined,
               latitude: metadata.latitude,
               longitude: metadata.longitude,
               ...imageDetails,
@@ -1574,6 +1659,8 @@ export default function Home() {
         hash: photo.hash,
         sharpness: photo.sharpness,
         exposure: photo.exposure,
+        zoom: photo.zoom,
+        crop: photo.crop,
         latitude: photo.latitude,
         longitude: photo.longitude,
         detectedPlace: photo.detectedPlace,
@@ -1633,6 +1720,8 @@ export default function Home() {
         hash: photo.hash,
         sharpness: photo.sharpness,
         exposure: photo.exposure,
+        zoom: photo.zoom,
+        crop: photo.crop,
         detectedPlace: photo.detectedPlace,
         latitude: photo.latitude,
         longitude: photo.longitude,
@@ -1813,6 +1902,8 @@ export default function Home() {
           hash: photo.hash,
           sharpness: photo.sharpness,
           exposure: photo.exposure,
+          zoom: cleanZoom(photo.zoom),
+          crop: cleanCrop(photo.crop),
           latitude: photo.latitude,
           longitude: photo.longitude,
           detectedPlace: photo.detectedPlace,
@@ -2575,6 +2666,15 @@ export default function Home() {
           <details>
             <summary aria-label={`פעולות לתמונה ${photo.name}`}>⋮</summary>
             <div>
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.currentTarget.closest("details")?.removeAttribute("open");
+                  setAdjustingPhotoId(photo.id);
+                }}
+              >
+                גודל וחיתוך
+              </button>
               <label className="photo-menu-file">
                 החלפת תמונה
                 <input
@@ -2635,17 +2735,21 @@ export default function Home() {
           </details>
         </div>
         <div
-          className="photo-frame"
-          style={{ "--photo-ratio": photo.width && photo.height ? photo.width / photo.height : 1 } as CSSProperties}
+          className="photo-frame adj-frame"
+          data-photo-id={photo.id}
+          style={photoAdjustStyle(photo)}
         >
-          <img
-            src={photo.url}
-            alt={photo.name}
-            onLoad={(event) => event.currentTarget.closest("figure")?.classList.remove("image-error")}
-            onError={(event) => {
-              event.currentTarget.closest("figure")?.classList.add("image-error");
-            }}
-          />
+          <div className="adj-box">
+            <img
+              src={photo.url}
+              alt={photo.name}
+              draggable={false}
+              onLoad={(event) => event.currentTarget.closest("figure")?.classList.remove("image-error")}
+              onError={(event) => {
+                event.currentTarget.closest("figure")?.classList.add("image-error");
+              }}
+            />
+          </div>
           <span className="photo-repick">לא ניתן להציג את התמונה. לחצי לבחירת תמונה אחרת.</span>
           {renderPhotoPicker(photo)}
         </div>
@@ -2790,6 +2894,17 @@ export default function Home() {
 
   return (
     <main className={`app-shell font-${albumFont}`} dir="rtl">
+      {adjustingPhoto && (
+        <PhotoAdjustDialog
+          key={adjustingPhoto.id}
+          photo={adjustingPhoto}
+          onClose={() => setAdjustingPhotoId("")}
+          onSave={(zoom, crop) => {
+            savePhotoAdjust(adjustingPhoto.id, zoom, crop);
+            setAdjustingPhotoId("");
+          }}
+        />
+      )}
       {showDuplicates && (
         <div className="duplicate-overlay" role="dialog" aria-modal="true" aria-labelledby="duplicate-title">
           <div className="duplicate-panel">
