@@ -136,6 +136,14 @@ type PrintablePage =
 
 type PhotoOrientation = "portrait" | "landscape" | "square";
 
+// On iPhone/iPad, asking only for "image/*" makes iOS hand over ready JPEGs instead of HEIC,
+// so the browser does not have to convert them (that conversion can run Safari out of memory).
+const IS_IOS = typeof navigator !== "undefined" && (
+  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+);
+const PHOTO_ACCEPT = IS_IOS ? "image/*" : "image/*,.heic,.heif";
+
 const IMAGE_FILE_PATTERN = /\.(jpg|jpeg|png|webp|gif|heic|heif)$/i;
 
 function isSupportedImageFile(file: File) {
@@ -187,7 +195,7 @@ const ALBUM_STORE_NAME = "albums";
 const PHOTO_LIBRARY_STORE_NAME = "photo-libraries";
 const CURRENT_ALBUM_ID = "current";
 const DEFAULT_ALBUM_FONT: AlbumFont = "classic";
-const PHOTO_COUNT_OPTIONS = [1, 2, 3, 4, 6];
+const PHOTO_COUNT_OPTIONS = [1, 2, 3, 4, 5, 6];
 const DEFAULT_ROUTE_PLACES = [
   "נקודת יציאה",
   "יעד ראשון",
@@ -290,6 +298,117 @@ function getPageOrientationClass(pagePhotos: Photo[]) {
   return "layout-mixed";
 }
 
+function photoRatio(photo: Photo) {
+  const ratio = photo.width && photo.height ? photo.width / photo.height : 1;
+  return Math.min(3.5, Math.max(0.3, ratio));
+}
+
+type LayoutLine = { grow: number; items: Array<{ index: number; grow: number }> };
+type PageLayoutPlan = { mode: "rows" | "cols"; lines: LayoutLine[] };
+
+// Geometric mean of the photo areas: rewards using the page well, but punishes one huge photo next to tiny ones.
+function balancedScore(areas: number[]) {
+  if (!areas.length || areas.some((area) => area <= 0)) return 0;
+  return Math.exp(areas.reduce((sum, area) => sum + Math.log(area), 0) / areas.length);
+}
+
+// Every way to split n photos, in order, into consecutive groups (n ≤ 6 → at most 32 options).
+function orderedGroupings(count: number): number[][] {
+  if (count <= 0) return [[]];
+  const results: number[][] = [];
+  for (let mask = 0; mask < 1 << (count - 1); mask += 1) {
+    const sizes: number[] = [];
+    let size = 1;
+    for (let index = 0; index < count - 1; index += 1) {
+      if (mask & (1 << index)) {
+        sizes.push(size);
+        size = 1;
+      } else {
+        size += 1;
+      }
+    }
+    sizes.push(size);
+    results.push(sizes);
+  }
+  return results;
+}
+
+// Chooses rows or columns so that each cell has the same shape as its photo
+// (portrait cells for portrait photos, wide cells for landscape ones) and the photos cover as much of the page as possible.
+function planPageLayout(ratios: number[], slotCount: number): PageLayoutPlan {
+  const width = 1;
+  const height = 1.2; // photo area of an A4 page, below the page title
+  const gap = 0.03;
+  const caption = slotCount <= 2 ? 0.12 : slotCount <= 4 ? 0.1 : 0.09;
+  const fallback: PageLayoutPlan = {
+    mode: "rows",
+    lines: [{ grow: 1, items: ratios.map((ratio, index) => ({ index, grow: ratio })) }],
+  };
+  if (!ratios.length) return fallback;
+
+  let best: { score: number; plan: PageLayoutPlan } | null = null;
+  for (const sizes of orderedGroupings(ratios.length)) {
+    const groups: number[][] = [];
+    let cursor = 0;
+    sizes.forEach((size) => {
+      groups.push(Array.from({ length: size }, (_, offset) => cursor + offset));
+      cursor += size;
+    });
+
+    // Rows: photos in a row share one height.
+    const rowHeights = groups.map((group) => (
+      (width - gap * (group.length - 1)) / group.reduce((sum, index) => sum + ratios[index], 0)
+    ));
+    const rowSpace = height - groups.length * caption - gap * (groups.length - 1);
+    if (rowSpace > 0) {
+      const scale = Math.min(1, rowSpace / rowHeights.reduce((sum, value) => sum + value, 0));
+      const area = balancedScore(groups.flatMap((group, line) => (
+        group.map((index) => ratios[index] * (scale * rowHeights[line]) ** 2)
+      )));
+      if (!best || area > best.score) {
+        best = {
+          score: area,
+          plan: {
+            mode: "rows",
+            lines: groups.map((group, line) => ({
+              grow: scale * rowHeights[line] + caption,
+              items: group.map((index) => ({ index, grow: ratios[index] })),
+            })),
+          },
+        };
+      }
+    }
+
+    // Columns: photos in a column share one width (each photo has its own caption underneath).
+    if (groups.length > 1) {
+      const columnWidths = groups.map((group) => (
+        (height - group.length * caption - gap * (group.length - 1)) /
+        group.reduce((sum, index) => sum + 1 / ratios[index], 0)
+      ));
+      if (columnWidths.every((value) => value > 0)) {
+        const scale = Math.min(1, (width - gap * (groups.length - 1)) / columnWidths.reduce((sum, value) => sum + value, 0));
+        const area = 0.97 * balancedScore(groups.flatMap((group, line) => (
+          group.map((index) => (scale * columnWidths[line]) ** 2 / ratios[index])
+        )));
+        if (!best || area > best.score) {
+          best = {
+            score: area,
+            plan: {
+              mode: "cols",
+              lines: groups.map((group, line) => ({
+                grow: scale * columnWidths[line],
+                items: group.map((index) => ({ index, grow: (scale * columnWidths[line]) / ratios[index] + caption })),
+              })),
+            },
+          };
+        }
+      }
+    }
+  }
+
+  return best?.plan || fallback;
+}
+
 function isHeicFile(file: File) {
   return (
     /image\/hei[cf]/i.test(file.type) ||
@@ -364,7 +483,15 @@ type ExifrParse = (input: Blob, options: Record<string, unknown>) => Promise<Rec
 
 // Reads when the photo was actually taken (EXIF), plus its GPS position.
 // file.lastModified is only the download/export time, which is wrong for iCloud, ZIP and converted HEIC files.
-async function readPhotoMetadata(blob: Blob): Promise<PhotoMetadata> {
+// Never let a slow or stuck metadata read hold up adding the photo.
+function readPhotoMetadata(blob: Blob): Promise<PhotoMetadata> {
+  return Promise.race([
+    readPhotoMetadataNow(blob),
+    new Promise<PhotoMetadata>((resolve) => setTimeout(() => resolve({}), 6000)),
+  ]);
+}
+
+async function readPhotoMetadataNow(blob: Blob): Promise<PhotoMetadata> {
   try {
     const exifrModule = await import("exifr");
     const imported = exifrModule as unknown as { parse?: ExifrParse; default?: { parse?: ExifrParse } };
@@ -1929,7 +2056,7 @@ export default function Home() {
       }
     };
 
-    const batchSize = 3;
+    const batchSize = IS_IOS ? 1 : 3;
     for (let batchStart = 0; batchStart < uniqueImageFiles.length; batchStart += batchSize) {
       const batch = uniqueImageFiles.slice(batchStart, batchStart + batchSize);
       const results = await Promise.all(batch.map((file, offset) => processFile(file, batchStart + offset)));
@@ -2058,7 +2185,7 @@ export default function Home() {
 
   function renderPhotoPicker(photo: Photo) {
     return (
-      <input className="photo-position-picker" type="file" accept="image/*,.heic,.heif"
+      <input className="photo-position-picker" type="file" accept={PHOTO_ACCEPT}
         aria-label={`בחרי תמונה למיקום הזה במקום ${photo.name}`}
         title="בחרי תמונה למיקום הזה"
         disabled={isLoading}
@@ -2190,6 +2317,155 @@ export default function Home() {
       : 0;
     const photoGridCount = Math.max(1, pagePhotos.length + emptySlotsCount);
     const pageOrientationClass = getPageOrientationClass(pagePhotos);
+    const layoutPlan = planPageLayout([
+      ...pagePhotos.map(photoRatio),
+      ...Array.from({ length: emptySlotsCount }, () => 1),
+    ], photoGridCount);
+    const renderFigure = (photo: Photo, grow: number) => (
+      <figure
+        style={{ flexGrow: grow }}
+        className={[
+          draggedPhotoId === photo.id ? "is-dragging" : "",
+          dropTarget?.type === "photo" && dropTarget.id === photo.id ? "is-drop-target" : "",
+          `orientation-${getPhotoOrientation(photo)}`,
+        ].filter(Boolean).join(" ")}
+        draggable
+        key={photo.id}
+        onDragEnd={() => {
+          setDraggedPhotoId("");
+          setDropTarget(null);
+        }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          setDropTarget({ type: "photo", id: photo.id });
+        }}
+        onDragStart={(event) => {
+          setDraggedPhotoId(photo.id);
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", photo.id);
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          finishPhotoDrop({ type: "photo", id: photo.id });
+        }}
+      >
+        <div className="photo-menu">
+          <details>
+            <summary aria-label={`פעולות לתמונה ${photo.name}`}>⋮</summary>
+            <div>
+              <label className="photo-menu-file">
+                החלפת תמונה
+                <input
+                  type="file"
+                  accept={PHOTO_ACCEPT}
+                  onChange={(event) => replacePhoto(event, photo)}
+                  disabled={isLoading}
+                />
+              </label>
+              <button type="button" onClick={() => setStatus("לחצי לחיצה ארוכה וגררי את התמונה לתמונה אחרת כדי להחליף מיקום.")}>
+                שינוי סדר בגרירה
+              </button>
+              <label className="photo-menu-page">
+                העברה לעמוד
+                <select
+                  defaultValue=""
+                  onChange={(event) => {
+                    const pageNumber = Number(event.target.value);
+                    if (pageNumber) movePhotoToPage(photo, pageNumber);
+                    event.target.value = "";
+                    event.currentTarget.closest("details")?.removeAttribute("open");
+                  }}
+                >
+                  <option value="" disabled>בחרי עמוד</option>
+                  {pages.map((albumPage) => (
+                    <option value={albumPage.pageIndex + 1} key={albumPage.pageIndex}>
+                      עמוד {albumPage.pageIndex + 1}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+              type="button"
+              onClick={(event) => {
+                event.currentTarget.closest("details")?.removeAttribute("open");
+                identifyPhotoCaption(photo);
+              }}
+              disabled={analyzingCaptions[photo.id]}
+            >
+              {analyzingCaptions[photo.id] ? "מזהה מקום..." : "זיהוי מקום לכיתוב"}
+            </button>
+            <button
+              type="button"
+              onClick={(event) => {
+                event.currentTarget.closest("details")?.removeAttribute("open");
+                clearPhotoCaption(photo.id);
+              }}
+            >
+              מחיקת כיתוב
+            </button>
+            <button type="button" onClick={() => duplicatePhoto(photo)}>
+                שכפל תמונה
+              </button>
+              <button className="danger-action" type="button" onClick={() => deletePhoto(photo)}>
+                מחק תמונה
+              </button>
+            </div>
+          </details>
+        </div>
+        <div
+          className="photo-frame"
+          style={{ "--photo-ratio": photo.width && photo.height ? photo.width / photo.height : 1 } as CSSProperties}
+        >
+          <img
+            src={photo.url}
+            alt={photo.name}
+            onLoad={(event) => event.currentTarget.closest("figure")?.classList.remove("image-error")}
+            onError={(event) => {
+              event.currentTarget.closest("figure")?.classList.add("image-error");
+            }}
+          />
+          <span className="photo-repick">לא ניתן להציג את התמונה. לחצי לבחירת תמונה אחרת.</span>
+          {renderPhotoPicker(photo)}
+        </div>
+        <figcaption>
+          {showPhotoDates && (
+            <time className="photo-date" dateTime={photo.date.toISOString()}>{formatDate(photo.date)}</time>
+          )}
+          <textarea
+            aria-label={`כיתוב לתמונה ${photo.name}`}
+            className="inline-edit caption-edit"
+            rows={pagePhotos.length >= 4 ? 2 : 3}
+            value={photoCaptions[photo.id] ?? ""}
+            onFocus={() => rememberFieldEdit("עריכת כיתוב תמונה")}
+            onChange={(event) => updatePhotoCaption(photo.id, event.target.value)}
+            placeholder="כיתוב / הסבר קצר לתמונה"
+          />
+          {captionSources[photo.id] === "auto" && photoCaptions[photo.id]?.trim() && (
+            <small className="auto-caption-note">כיתוב אוטומטי</small>
+          )}
+          </figcaption>
+      </figure>
+    );
+    const renderDropSlot = (emptySlotIndex: number, grow: number) => {
+      const targetIndex = startIndex + pagePhotos.length + emptySlotIndex;
+      return (
+      <div
+        style={{ flexGrow: grow }}
+        className={`photo-drop-slot ${dropTarget?.type === "empty" && dropTarget.index === targetIndex ? "is-drop-target" : ""}`}
+        key={`empty-${pageIndex}-${emptySlotIndex}`}
+        onDragOver={(event) => {
+          event.preventDefault();
+          setDropTarget({ type: "empty", index: targetIndex });
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          finishPhotoDrop({ type: "empty", index: targetIndex });
+        }}
+      >
+        שחררי כאן
+      </div>
+      );
+    };
 
     return (
       <article className={`book-page ${visibilityClass} sheet photo-sheet photos-${photoGridCount}`} key={`photo-page-${pageIndex}`}>
@@ -2275,147 +2551,16 @@ export default function Home() {
             {DECORATION_LABELS[pageDecorations[pageKey] || "none"]}
           </div>
         )}
-        <div className={`photo-grid count-${photoGridCount} ${pageOrientationClass}`}>
-          {pagePhotos.map((photo) => (
-            <figure
-              className={[
-                draggedPhotoId === photo.id ? "is-dragging" : "",
-                dropTarget?.type === "photo" && dropTarget.id === photo.id ? "is-drop-target" : "",
-                `orientation-${getPhotoOrientation(photo)}`,
-              ].filter(Boolean).join(" ")}
-              draggable
-              key={photo.id}
-              onDragEnd={() => {
-                setDraggedPhotoId("");
-                setDropTarget(null);
-              }}
-              onDragOver={(event) => {
-                event.preventDefault();
-                setDropTarget({ type: "photo", id: photo.id });
-              }}
-              onDragStart={(event) => {
-                setDraggedPhotoId(photo.id);
-                event.dataTransfer.effectAllowed = "move";
-                event.dataTransfer.setData("text/plain", photo.id);
-              }}
-              onDrop={(event) => {
-                event.preventDefault();
-                finishPhotoDrop({ type: "photo", id: photo.id });
-              }}
-            >
-              <div className="photo-menu">
-                <details>
-                  <summary aria-label={`פעולות לתמונה ${photo.name}`}>⋮</summary>
-                  <div>
-                    <label className="photo-menu-file">
-                      החלפת תמונה
-                      <input
-                        type="file"
-                        accept="image/*,.heic,.heif"
-                        onChange={(event) => replacePhoto(event, photo)}
-                        disabled={isLoading}
-                      />
-                    </label>
-                    <button type="button" onClick={() => setStatus("לחצי לחיצה ארוכה וגררי את התמונה לתמונה אחרת כדי להחליף מיקום.")}>
-                      שינוי סדר בגרירה
-                    </button>
-                    <label className="photo-menu-page">
-                      העברה לעמוד
-                      <select
-                        defaultValue=""
-                        onChange={(event) => {
-                          const pageNumber = Number(event.target.value);
-                          if (pageNumber) movePhotoToPage(photo, pageNumber);
-                          event.target.value = "";
-                          event.currentTarget.closest("details")?.removeAttribute("open");
-                        }}
-                      >
-                        <option value="" disabled>בחרי עמוד</option>
-                        {pages.map((albumPage) => (
-                          <option value={albumPage.pageIndex + 1} key={albumPage.pageIndex}>
-                            עמוד {albumPage.pageIndex + 1}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <button type="button" onClick={() => duplicatePhoto(photo)}>
-                      שכפל תמונה
-                    </button>
-                    <button className="danger-action" type="button" onClick={() => deletePhoto(photo)}>
-                      מחק תמונה
-                    </button>
-                  </div>
-                </details>
-              </div>
-              <div
-                className="photo-frame"
-                style={{ "--photo-ratio": photo.width && photo.height ? photo.width / photo.height : 1 } as CSSProperties}
-              >
-                <img
-                  src={photo.url}
-                  alt={photo.name}
-                  onLoad={(event) => event.currentTarget.closest("figure")?.classList.remove("image-error")}
-                  onError={(event) => {
-                    event.currentTarget.closest("figure")?.classList.add("image-error");
-                  }}
-                />
-                <span className="photo-repick">לא ניתן להציג את התמונה. לחצי לבחירת תמונה אחרת.</span>
-                {renderPhotoPicker(photo)}
-              </div>
-              <figcaption>
-                {showPhotoDates && (
-                  <time className="photo-date" dateTime={photo.date.toISOString()}>{formatDate(photo.date)}</time>
-                )}
-                <textarea
-                  aria-label={`כיתוב לתמונה ${photo.name}`}
-                  className="inline-edit caption-edit"
-                  rows={pagePhotos.length === 4 ? 2 : 3}
-                  value={photoCaptions[photo.id] ?? ""}
-                  onFocus={() => rememberFieldEdit("עריכת כיתוב תמונה")}
-                  onChange={(event) => updatePhotoCaption(photo.id, event.target.value)}
-                  placeholder="כיתוב / הסבר קצר לתמונה"
-                />
-                {captionSources[photo.id] === "auto" && photoCaptions[photo.id]?.trim() && (
-                  <small className="auto-caption-note">כיתוב אוטומטי</small>
-                )}
-                <span className="caption-actions">
-                  <button
-                    type="button"
-                    onClick={() => identifyPhotoCaption(photo)}
-                    disabled={analyzingCaptions[photo.id]}
-                  >
-                    {analyzingCaptions[photo.id] ? "מזהה..." : "זהי מקום"}
-                  </button>
-                  <button type="button" onClick={() => suggestPhotoCaption(photo)}>
-                    הצע
-                  </button>
-                  <button type="button" onClick={() => clearPhotoCaption(photo.id)}>
-                    מחק כיתוב
-                  </button>
-                </span>
-              </figcaption>
-            </figure>
+        <div className={`photo-grid smart-layout count-${photoGridCount} ${pageOrientationClass} layout-${layoutPlan.mode}`}>
+          {layoutPlan.lines.map((line, lineIndex) => (
+            <div className="photo-line" key={`line-${lineIndex}`} style={{ flexGrow: line.grow }}>
+              {line.items.map((item) => (
+                item.index < pagePhotos.length
+                  ? renderFigure(pagePhotos[item.index], item.grow)
+                  : renderDropSlot(item.index - pagePhotos.length, item.grow)
+              ))}
+            </div>
           ))}
-          {Array.from({ length: emptySlotsCount }).map((_, emptySlotIndex) => {
-            const targetIndex = startIndex + pagePhotos.length + emptySlotIndex;
-
-            return (
-              <div
-                className={`photo-drop-slot ${dropTarget?.type === "empty" && dropTarget.index === targetIndex ? "is-drop-target" : ""}`}
-                key={`empty-${pageIndex}-${emptySlotIndex}`}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  setDropTarget({ type: "empty", index: targetIndex });
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  finishPhotoDrop({ type: "empty", index: targetIndex });
-                }}
-              >
-                שחררי כאן
-              </div>
-            );
-          })}
         </div>
       </article>
     );
@@ -2457,7 +2602,7 @@ export default function Home() {
           <p className="hint">באייפון ייפתחו התמונות שלך, כולל תמונות שנמצאות ב־iCloud.</p>
           <label className="upload-primary">
             {isLoading ? "טוענת תמונות..." : "בחירת תמונות"}
-            <input className="file-input" type="file" accept="image/*,.heic,.heif" multiple onChange={handleFiles} disabled={isLoading || !hasCheckedSavedAlbum} />
+            <input className="file-input" type="file" accept={PHOTO_ACCEPT} multiple onChange={handleFiles} disabled={isLoading || !hasCheckedSavedAlbum} />
           </label>
           {isLoading && uploadTotal > 0 && (
             <div className="upload-progress" aria-live="polite">
@@ -2473,7 +2618,7 @@ export default function Home() {
                 <input
                   className="file-input"
                   type="file"
-                  accept="image/*,.heic,.heif"
+                  accept={PHOTO_ACCEPT}
                   multiple
                   {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
                   onChange={handleFiles}
@@ -2525,14 +2670,14 @@ export default function Home() {
               </label>
               <label className="upload-secondary">
                 {isSavingLibrary ? "שומרת במאגר..." : "בחירת תמונות לאלבום"}
-                <input className="file-input" type="file" accept="image/*,.heic,.heif" multiple onChange={handleLibraryFiles} disabled={isLoading || !newLibraryName.trim()} />
+                <input className="file-input" type="file" accept={PHOTO_ACCEPT} multiple onChange={handleLibraryFiles} disabled={isLoading || !newLibraryName.trim()} />
               </label>
               <div className="library-import-row">
                 <label className="file-action">
                   תיקייה שלמה
                   <input
                     type="file"
-                    accept="image/*,.heic,.heif"
+                    accept={PHOTO_ACCEPT}
                     multiple
                     {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
                     onChange={handleLibraryFiles}
@@ -2604,6 +2749,7 @@ export default function Home() {
           ברירת מחדל לתמונות בעמוד
           <select value={photosPerPage} onChange={(event) => changePhotosPerPage(Number(event.target.value))}>
             <option value={6}>עד 6 תמונות בעמוד</option>
+            <option value={5}>עד 5 תמונות בעמוד</option>
             <option value={4}>עד 4 תמונות בעמוד</option>
             <option value={3}>עד 3 תמונות בעמוד</option>
             <option value={2}>עד 2 תמונות בעמוד</option>
@@ -2632,7 +2778,7 @@ export default function Home() {
 
           <label className="field">
             העלאת תמונת כריכה אחרת
-            <input type="file" accept="image/*,.heic,.heif" onChange={handleCoverFile} disabled={isLoading || !hasCheckedSavedAlbum} />
+            <input type="file" accept={PHOTO_ACCEPT} onChange={handleCoverFile} disabled={isLoading || !hasCheckedSavedAlbum} />
           </label>
 
           <button type="button" onClick={clearCover} disabled={coverPhotoId === "none" && !customCover}>

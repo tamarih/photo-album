@@ -5,3 +5,33 @@
    so it must show the right half of the image. */
 .spread-start .spread-photo-image{left:-100%}
 .spread-end .spread-photo-image{left:0}
+
+/* Smart page layout: each cell takes the shape of its photo (rows or columns chosen per page). */
+.photo-grid.smart-layout{display:flex;gap:10px;min-height:0;min-width:0}
+.photo-grid.smart-layout.layout-rows{flex-direction:column}
+.photo-grid.smart-layout.layout-cols{flex-direction:row}
+.photo-line{display:flex;gap:10px;flex-basis:0;flex-shrink:1;min-height:0;min-width:0}
+.layout-rows .photo-line{flex-direction:row}
+.layout-cols .photo-line{flex-direction:column}
+.photo-line>figure,.photo-line>.photo-drop-slot{flex-basis:0;flex-shrink:1;min-height:0;min-width:0}
+.photo-grid.smart-layout .photo-frame img,
+.photo-grid.smart-layout figure.orientation-portrait .photo-frame img,
+.photo-grid.smart-layout figure.orientation-landscape .photo-frame img{width:100%;height:100%;max-width:none;max-height:none;object-fit:contain}
+.photo-grid.count-4 .photo-line,.photo-grid.count-4.smart-layout{gap:8px}
+.photo-grid.count-5.smart-layout,.photo-grid.count-6.smart-layout,
+.photo-grid.count-5 .photo-line,.photo-grid.count-6 .photo-line{gap:6px}
+.photo-sheet.photos-5,.photo-sheet.photos-6{gap:2.4%;padding:5.5%}
+.photos-5 .page-header,.photos-6 .page-header{padding-bottom:1.8%}
+.photo-grid.count-5 figure{gap:3px;padding:4px}
+.photo-grid.count-5 figcaption,.photo-grid.count-6 figcaption{font-size:.7rem;gap:2px;line-height:1.1}
+.photo-grid.count-5 .caption-edit,.photo-grid.count-6 .caption-edit{min-height:2.3em;font-size:.68rem;line-height:1.12}
+.photo-grid.count-5 .caption-actions button,.photo-grid.count-6 .caption-actions button{padding:3px 6px;font-size:.64rem}
+@media print{
+  .photo-grid.smart-layout,.photo-line{gap:4mm}
+  .photo-grid.count-5.smart-layout,.photo-grid.count-6.smart-layout,.photo-grid.count-5 .photo-line,.photo-grid.count-6 .photo-line{gap:3mm}
+  .photo-sheet.photos-5,.photo-sheet.photos-6{gap:2%;padding:5mm}
+  .photo-grid.count-5 figure{padding:2mm}
+  .photo-grid.count-5 .caption-edit,.photo-grid.count-6 .caption-edit{min-height:1.2em}
+}
+.photo-grid.smart-layout .caption-edit{min-height:2.6em}
+.photo-grid.smart-layout.count-4 .caption-edit,.photo-grid.smart-layout.count-5 .caption-edit,.photo-grid.smart-layout.count-6 .caption-edit{min-height:2.3em}
