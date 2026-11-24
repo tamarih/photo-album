@@ -28,6 +28,10 @@ type Photo = {
   latitude?: number;
   longitude?: number;
   detectedPlace?: string;
+  // For finding duplicates: a 64-bit visual fingerprint, a sharpness score and the average light level.
+  hash?: string;
+  sharpness?: number;
+  exposure?: number;
 };
 
 type CoverImage = Pick<Photo, "id" | "name" | "url">;
@@ -438,8 +442,117 @@ async function fileToDisplayBlob(file: File) {
   return Array.isArray(converted) ? converted[0] : converted;
 }
 
+const luma = (pixels: Uint8ClampedArray, offset: number) => (
+  pixels[offset] * 0.299 + pixels[offset + 1] * 0.587 + pixels[offset + 2] * 0.114
+);
+
+// Visual fingerprint (difference hash) and sharpness (variance of the Laplacian) of an image.
+function analyzeImage(image: HTMLImageElement): Pick<Photo, "hash" | "sharpness"> {
+  const hashCanvas = document.createElement("canvas");
+  hashCanvas.width = 9;
+  hashCanvas.height = 8;
+  const hashContext = hashCanvas.getContext("2d", { willReadFrequently: true });
+  if (!hashContext) return {};
+  hashContext.drawImage(image, 0, 0, 9, 8);
+  const hashPixels = hashContext.getImageData(0, 0, 9, 8).data;
+  let hash = "";
+  for (let y = 0; y < 8; y += 1) {
+    let nibble = 0;
+    for (let x = 0; x < 8; x += 1) {
+      const left = luma(hashPixels, (y * 9 + x) * 4);
+      const right = luma(hashPixels, (y * 9 + x + 1) * 4);
+      nibble = (nibble << 1) | (left < right ? 1 : 0);
+      if (x % 4 === 3) {
+        hash += nibble.toString(16);
+        nibble = 0;
+      }
+    }
+  }
+
+  const maxSide = 256;
+  const scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
+  const width = Math.max(8, Math.round(image.naturalWidth * scale));
+  const height = Math.max(8, Math.round(image.naturalHeight * scale));
+  const sharpCanvas = document.createElement("canvas");
+  sharpCanvas.width = width;
+  sharpCanvas.height = height;
+  const sharpContext = sharpCanvas.getContext("2d", { willReadFrequently: true });
+  if (!sharpContext) return { hash };
+  sharpContext.drawImage(image, 0, 0, width, height);
+  const pixels = sharpContext.getImageData(0, 0, width, height).data;
+  const gray = new Float32Array(width * height);
+  for (let index = 0; index < gray.length; index += 1) gray[index] = luma(pixels, index * 4);
+  let sum = 0;
+  let sumSquares = 0;
+  let count = 0;
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const center = y * width + x;
+      const value = gray[center - 1] + gray[center + 1] + gray[center - width] + gray[center + width] - 4 * gray[center];
+      sum += value;
+      sumSquares += value * value;
+      count += 1;
+    }
+  }
+  const mean = count ? sum / count : 0;
+  return { hash, sharpness: count ? Math.round(sumSquares / count - mean * mean) : 0 };
+}
+
+function hashDistance(first: string, second: string) {
+  let distance = 0;
+  for (let index = 0; index < 16; index += 1) {
+    let bits = parseInt(first[index] || "0", 16) ^ parseInt(second[index] || "0", 16);
+    while (bits) {
+      distance += bits & 1;
+      bits >>= 1;
+    }
+  }
+  return distance;
+}
+
+// Higher is better: sharp first, then resolution, then a well-exposed (not too dark or bright) picture.
+function photoQuality(photo: Photo) {
+  const sharpness = Math.log1p(photo.sharpness || 0);
+  const pixels = Math.log((photo.width || 1) * (photo.height || 1));
+  const exposurePenalty = typeof photo.exposure === "number" ? Math.abs(photo.exposure - 125) / 125 : 0;
+  return sharpness * 2 + pixels * 0.3 - exposurePenalty * 1.5;
+}
+
+// Groups photos that are the same picture or near-identical shots (burst, retakes), in album order.
+function findSimilarGroups(photos: Photo[]) {
+  const parent = photos.map((_, index) => index);
+  const find = (index: number): number => (parent[index] === index ? index : (parent[index] = find(parent[index])));
+  const isCopyOf = (a: Photo, b: Photo) => a.id.startsWith(`${b.id}-copy-`) || b.id.startsWith(`${a.id}-copy-`);
+
+  for (let first = 0; first < photos.length; first += 1) {
+    for (let second = first + 1; second < photos.length; second += 1) {
+      const a = photos[first];
+      const b = photos[second];
+      if (isCopyOf(a, b)) continue;
+      let similar = Boolean(a.signature && a.signature === b.signature);
+      if (!similar && a.hash?.length === 16 && b.hash?.length === 16) {
+        const distance = hashDistance(a.hash, b.hash);
+        const minutesApart = Math.abs(a.date.getTime() - b.date.getTime()) / 60000;
+        similar = distance <= 4 || (distance <= 10 && minutesApart <= 15);
+      }
+      if (similar) parent[find(second)] = find(first);
+    }
+  }
+
+  const groups = new Map<number, Photo[]>();
+  photos.forEach((photo, index) => {
+    const root = find(index);
+    groups.set(root, [...(groups.get(root) || []), photo]);
+  });
+  return [...groups.values()].filter((group) => group.length > 1);
+}
+
+function bestPhotoOf(group: Photo[]) {
+  return group.reduce((best, photo) => (photoQuality(photo) > photoQuality(best) ? photo : best), group[0]);
+}
+
 function readImageDetails(url: string) {
-  return new Promise<Pick<Photo, "width" | "height" | "brightness">>((resolve) => {
+  return new Promise<Pick<Photo, "width" | "height" | "brightness" | "hash" | "sharpness" | "exposure">>((resolve) => {
     const image = new Image();
     image.onload = () => {
       const canvas = document.createElement("canvas");
@@ -462,10 +575,18 @@ function readImageDetails(url: string) {
       }
 
       const average = total / (pixels.length / 4);
+      let analysis: Pick<Photo, "hash" | "sharpness"> = {};
+      try {
+        analysis = analyzeImage(image);
+      } catch {
+        // Analysis only helps find duplicates; the photo is fine without it.
+      }
       resolve({
         width: image.naturalWidth,
         height: image.naturalHeight,
         brightness: average > 178 ? "bright" : average < 92 ? "dark" : "soft",
+        exposure: Math.round(average),
+        ...analysis,
       });
     };
     image.onerror = () => resolve({});
@@ -815,9 +936,101 @@ export default function Home() {
   const [currentSpread, setCurrentSpread] = useState(0);
   const [draggedPhotoId, setDraggedPhotoId] = useState("");
   const [dropTarget, setDropTarget] = useState<DropTarget>(null);
+  const [showDuplicates, setShowDuplicates] = useState(false);
+  const [duplicateRemovals, setDuplicateRemovals] = useState<Set<string>>(new Set());
+  const [keptDuplicateGroups, setKeptDuplicateGroups] = useState<Set<string>>(new Set());
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const analyzingIds = useRef<Set<string>>(new Set());
 
   const albumPhotos = photos;
+  const duplicateGroups = useMemo(
+    () => findSimilarGroups(photos).filter((group) => !keptDuplicateGroups.has(group.map((photo) => photo.id).sort().join("|"))),
+    [photos, keptDuplicateGroups],
+  );
+
+  // Photos saved before duplicate detection existed get their fingerprint in the background, one at a time.
+  useEffect(() => {
+    const pending = photos.find((photo) => !photo.hash && !analyzingIds.current.has(photo.id));
+    if (!pending) return;
+    analyzingIds.current.add(pending.id);
+    readImageDetails(pending.url).then((details) => {
+      setPhotos((current) => current.map((photo) => (
+        photo.id === pending.id
+          ? { ...photo, hash: details.hash || "-", sharpness: details.sharpness, exposure: details.exposure }
+          : photo
+      )));
+    });
+  }, [photos]);
+
+  function openDuplicateReview() {
+    const removals = new Set<string>();
+    duplicateGroups.forEach((group) => {
+      const best = bestPhotoOf(group);
+      group.forEach((photo) => {
+        if (photo.id !== best.id) removals.add(photo.id);
+      });
+    });
+    setDuplicateRemovals(removals);
+    setShowDuplicates(true);
+  }
+
+  function toggleDuplicateRemoval(photoId: string) {
+    setDuplicateRemovals((current) => {
+      const next = new Set(current);
+      if (next.has(photoId)) next.delete(photoId);
+      else next.add(photoId);
+      return next;
+    });
+  }
+
+  function keepDuplicateGroup(group: Photo[]) {
+    setKeptDuplicateGroups((current) => new Set(current).add(group.map((photo) => photo.id).sort().join("|")));
+    setDuplicateRemovals((current) => {
+      const next = new Set(current);
+      group.forEach((photo) => next.delete(photo.id));
+      return next;
+    });
+  }
+
+  function removePhotos(ids: Set<string>, label: string) {
+    if (!ids.size) return;
+    rememberUndo(label);
+    // A removed photo that opened a page hands that page's settings to the next photo that stays.
+    const nextKeptId = (photoId: string) => {
+      const start = photos.findIndex((photo) => photo.id === photoId);
+      return photos.slice(start + 1).find((photo) => !ids.has(photo.id))?.id;
+    };
+    const handOver = <T,>(map: Record<string, T>) => {
+      const next = { ...map };
+      ids.forEach((photoId) => {
+        if (!(photoId in next)) return;
+        const heir = nextKeptId(photoId);
+        if (heir && !(heir in next)) next[heir] = next[photoId];
+        delete next[photoId];
+      });
+      return next;
+    };
+    const withoutIds = <T,>(map: Record<string, T>) => {
+      const next = { ...map };
+      ids.forEach((photoId) => delete next[photoId]);
+      return next;
+    };
+    setPageContent(handOver);
+    setPageLayouts(handOver);
+    setPageDecorations(handOver);
+    setPhotoCaptions(withoutIds);
+    setCaptionSources(withoutIds);
+    setPhotos((current) => current.filter((photo) => !ids.has(photo.id)));
+    if (ids.has(coverPhotoId)) setCoverPhotoId("none");
+  }
+
+  function removeChosenDuplicates() {
+    const count = duplicateRemovals.size;
+    removePhotos(duplicateRemovals, "הסרת תמונות כפולות");
+    setDuplicateRemovals(new Set());
+    setShowDuplicates(false);
+    setStatus(`הוסרו ${count} תמונות כפולות או דומות. אפשר לבטל עם "בטל פעולה אחרונה".`);
+  }
   const activePhotoLibrary = photoLibraries.find((library) => library.id === activeLibraryId) || null;
   const dateSortedPhotos = useMemo(() => sortPhotosByDate(photos), [photos]);
   const pages = useMemo(
@@ -1358,6 +1571,9 @@ export default function Home() {
         width: photo.width,
         height: photo.height,
         brightness: photo.brightness,
+        hash: photo.hash,
+        sharpness: photo.sharpness,
+        exposure: photo.exposure,
         latitude: photo.latitude,
         longitude: photo.longitude,
         detectedPlace: photo.detectedPlace,
@@ -1414,6 +1630,9 @@ export default function Home() {
         width: photo.width,
         height: photo.height,
         brightness: photo.brightness,
+        hash: photo.hash,
+        sharpness: photo.sharpness,
+        exposure: photo.exposure,
         detectedPlace: photo.detectedPlace,
         latitude: photo.latitude,
         longitude: photo.longitude,
@@ -1591,6 +1810,9 @@ export default function Home() {
           width: photo.width,
           height: photo.height,
           brightness: photo.brightness,
+          hash: photo.hash,
+          sharpness: photo.sharpness,
+          exposure: photo.exposure,
           latitude: photo.latitude,
           longitude: photo.longitude,
           detectedPlace: photo.detectedPlace,
@@ -2568,6 +2790,59 @@ export default function Home() {
 
   return (
     <main className={`app-shell font-${albumFont}`} dir="rtl">
+      {showDuplicates && (
+        <div className="duplicate-overlay" role="dialog" aria-modal="true" aria-labelledby="duplicate-title">
+          <div className="duplicate-panel">
+            <header>
+              <h2 id="duplicate-title">תמונות כפולות ודומות</h2>
+              <p>
+                בכל קבוצה סימנתי ⭐ את התמונה החדה והאיכותית ביותר. תמונות עם מסגרת אדומה יוסרו מהאלבום.
+                לחיצה על תמונה מחליפה בין &quot;נשארת&quot; ל&quot;תוסר&quot;.
+              </p>
+            </header>
+            <div className="duplicate-groups">
+              {duplicateGroups.length === 0 && <p className="hint">לא נשארו תמונות כפולות לבדיקה.</p>}
+              {duplicateGroups.map((group) => {
+                const best = bestPhotoOf(group);
+                return (
+                  <section className="duplicate-group" key={group.map((photo) => photo.id).join("|")}>
+                    <div className="duplicate-group-head">
+                      <strong>{group.length} תמונות דומות</strong>
+                      <button type="button" onClick={() => keepDuplicateGroup(group)}>להשאיר את כולן</button>
+                    </div>
+                    <div className="duplicate-photos">
+                      {group.map((photo) => {
+                        const removing = duplicateRemovals.has(photo.id);
+                        return (
+                          <button
+                            className={`duplicate-photo ${removing ? "is-removing" : "is-keeping"}`}
+                            type="button"
+                            key={photo.id}
+                            aria-pressed={!removing}
+                            aria-label={`${photo.name}: ${removing ? "תוסר" : "נשארת"}`}
+                            onClick={() => toggleDuplicateRemoval(photo.id)}
+                          >
+                            <img src={photo.url} alt="" />
+                            {photo.id === best.id && <span className="duplicate-best">⭐ הכי טובה</span>}
+                            <span className="duplicate-state">{removing ? "תוסר" : "נשארת"}</span>
+                            <small>{formatDate(photo.date)} · {photo.width && photo.height ? `${photo.width}×${photo.height}` : ""}</small>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                );
+              })}
+            </div>
+            <footer>
+              <button className="primary" type="button" onClick={removeChosenDuplicates} disabled={!duplicateRemovals.size}>
+                הסרת {duplicateRemovals.size} {duplicateRemovals.size === 1 ? "תמונה" : "תמונות"} מהאלבום
+              </button>
+              <button type="button" onClick={() => setShowDuplicates(false)}>סגירה</button>
+            </footer>
+          </div>
+        </div>
+      )}
       <dialog ref={coverDialog} className="cover-editor" aria-labelledby="cover-editor-label" onClose={() => setCoverEdit(null)}>
         {coverEdit && (
           <form onSubmit={(event) => {
@@ -2638,6 +2913,12 @@ export default function Home() {
           <button className="demo-button" type="button" onClick={addDemoPhoto} disabled={!hasCheckedSavedAlbum}>רוצה לראות דוגמה לפני שמתחילים?</button>
           <p className="hint">{dateRange}</p>
           <p className="status-message" aria-live="polite">{status}</p>
+          {duplicateGroups.length > 0 && (
+            <button className="duplicate-alert" type="button" onClick={openDuplicateReview}>
+              נמצאו {duplicateGroups.length === 1 ? "קבוצה אחת" : `${duplicateGroups.length} קבוצות`} של תמונות כפולות או דומות
+              <span>לבחירת הטובה מכל קבוצה ←</span>
+            </button>
+          )}
           {debug.length > 0 && (
             <details className="debug-details">
               <summary>פרטי תקלה</summary>

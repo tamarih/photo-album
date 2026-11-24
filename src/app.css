@@ -35,3 +35,27 @@
 }
 .photo-grid.smart-layout .caption-edit{min-height:2.6em}
 .photo-grid.smart-layout.count-4 .caption-edit,.photo-grid.smart-layout.count-5 .caption-edit,.photo-grid.smart-layout.count-6 .caption-edit{min-height:2.3em}
+
+/* Duplicate photos */
+.duplicate-alert{display:grid;gap:2px;text-align:start;background:#fff4e5;border:1px solid #d9a35b;color:#7a4a12;border-radius:8px;padding:10px 12px;font-size:.86rem}
+.duplicate-alert span{font-weight:750;text-decoration:underline;text-underline-offset:3px}
+.duplicate-overlay{position:fixed;inset:0;z-index:50;background:#211f1d73;display:grid;place-items:center;padding:max(12px,env(safe-area-inset-top)) 12px 12px}
+.duplicate-panel{background:var(--paper);border-radius:14px;box-shadow:0 30px 70px #0005;width:min(760px,100%);max-height:calc(100dvh - 24px);display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden}
+.duplicate-panel header{padding:16px 18px 8px}
+.duplicate-panel h2{color:var(--accent-strong);margin:0 0 6px;font-size:1.3rem}
+.duplicate-panel header p{color:var(--muted);margin:0;font-size:.9rem;line-height:1.5}
+.duplicate-groups{overflow:auto;padding:4px 18px 12px;display:grid;gap:14px;align-content:start}
+.duplicate-group{border:1px solid var(--line);border-radius:10px;padding:10px;background:#fff}
+.duplicate-group-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;color:var(--accent-strong)}
+.duplicate-group-head button{font-size:.78rem;padding:6px 10px}
+.duplicate-photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+.duplicate-photo{position:relative;display:grid;gap:4px;padding:5px;border:3px solid #3f8f5a;border-radius:9px;background:#fff;min-width:0}
+.duplicate-photo.is-removing{border-color:#c0392b;opacity:.62}
+.duplicate-photo img{width:100%;aspect-ratio:1;object-fit:contain;background:#f3eee8;border-radius:5px;display:block}
+.duplicate-photo small{color:var(--muted);font-size:.68rem;font-weight:600}
+.duplicate-state{font-size:.78rem;font-weight:850}
+.duplicate-photo.is-keeping .duplicate-state{color:#2e7a48}
+.duplicate-photo.is-removing .duplicate-state{color:#c0392b}
+.duplicate-best{position:absolute;top:9px;right:9px;background:#fffdf9;border-radius:999px;padding:2px 8px;font-size:.72rem;font-weight:850;color:#7a4a12;box-shadow:0 2px 6px #0002}
+.duplicate-panel footer{display:flex;gap:8px;padding:12px 18px;border-top:1px solid var(--line);flex-wrap:wrap}
+@media print{.duplicate-alert,.duplicate-overlay{display:none}}
