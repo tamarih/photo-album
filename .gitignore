@@ -1,0 +1,4 @@
+node_modules/
+dist/
+original-export/
+.claude/
