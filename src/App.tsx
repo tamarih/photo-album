@@ -442,7 +442,57 @@ function fileDateSignature(file: File) {
   return `${file.name.toLowerCase()}::${file.lastModified || 0}`;
 }
 
+// Long side of the copy kept in the album. Sharp enough for a full A4 page (about 300 dpi), and small
+// enough that an iPhone can show hundreds of photos without running out of memory (full 24-megapixel
+// photos make Safari and Chrome on iPhone show a "?" instead of the picture).
+const MAX_PHOTO_SIDE = 2400;
+
+function loadImage(url: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("image failed to load"));
+    image.src = url;
+  });
+}
+
+function isLargePhoto(width?: number, height?: number) {
+  return Math.max(width || 0, height || 0) > MAX_PHOTO_SIDE * 1.05;
+}
+
+// Returns a smaller JPEG copy of a large photo, keeping its proportions; small photos come back unchanged.
+async function shrinkLargeImage(blob: Blob): Promise<Blob> {
+  const url = URL.createObjectURL(blob);
+  try {
+    const image = await loadImage(url);
+    const longSide = Math.max(image.naturalWidth, image.naturalHeight);
+    if (!longSide || longSide <= MAX_PHOTO_SIDE * 1.05) return blob;
+    const scale = MAX_PHOTO_SIDE / longSide;
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(image.naturalWidth * scale);
+    canvas.height = Math.round(image.naturalHeight * scale);
+    const context = canvas.getContext("2d");
+    if (!context) return blob;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    image.src = "";
+    const smaller = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
+    canvas.width = 0;
+    canvas.height = 0;
+    return smaller && smaller.size > 0 ? smaller : blob;
+  } catch {
+    return blob;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function fileToDisplayBlob(file: File) {
+  return shrinkLargeImage(await fileToReadableBlob(file));
+}
+
+async function fileToReadableBlob(file: File): Promise<Blob> {
   if (!isHeicFile(file)) return file;
 
   const heic2anyModule = await import("heic2any");
@@ -1043,6 +1093,37 @@ export default function Home() {
           : photo
       )));
     });
+  }, [photos]);
+
+  // Photos saved at full size before MAX_PHOTO_SIDE existed are made lighter in the background, one at a time.
+  const shrinkingIds = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const pending = photos.find((photo) => (
+      isLargePhoto(photo.width, photo.height) && !shrinkingIds.current.has(photo.id)
+    ));
+    if (!pending) return;
+    shrinkingIds.current.add(pending.id);
+    (async () => {
+      try {
+        const original = await urlToBlob(pending.url);
+        const smaller = await shrinkLargeImage(original);
+        if (smaller === original) return;
+        const url = URL.createObjectURL(smaller);
+        const image = await loadImage(url);
+        const width = image.naturalWidth;
+        const height = image.naturalHeight;
+        image.src = "";
+        let replaced = false;
+        setPhotos((current) => current.map((photo) => {
+          if (photo.id !== pending.id || photo.url !== pending.url) return photo;
+          replaced = true;
+          return { ...photo, url, width, height };
+        }));
+        setTimeout(() => URL.revokeObjectURL(replaced ? pending.url : url), 1000);
+      } catch {
+        // Leave this photo as it is; it is tried again next time the album opens.
+      }
+    })();
   }, [photos]);
 
   function openDuplicateReview() {
@@ -2937,7 +3018,7 @@ export default function Home() {
                             aria-label={`${photo.name}: ${removing ? "תוסר" : "נשארת"}`}
                             onClick={() => toggleDuplicateRemoval(photo.id)}
                           >
-                            <img src={photo.url} alt="" />
+                            <img src={photo.url} alt="" loading="lazy" decoding="async" />
                             {photo.id === best.id && <span className="duplicate-best">⭐ הכי טובה</span>}
                             <span className="duplicate-state">{removing ? "תוסר" : "נשארת"}</span>
                             <small>{formatDate(photo.date)} · {photo.width && photo.height ? `${photo.width}×${photo.height}` : ""}</small>
